@@ -171,6 +171,7 @@ from .models import (
     TeamInvite,
     TimeSlot,
     UserBadge,
+    UserMembership,
     VideoRequest,
     VirtualClassroom,
     VirtualClassroomCustomization,
@@ -191,6 +192,7 @@ from .notifications import (
 from .referrals import send_referral_reward_email
 from .social import get_social_stats
 from .utils import (
+    can_access_classroom,
     cancel_subscription,
     create_leaderboard_context,
     create_subscription,
@@ -1569,6 +1571,14 @@ def course_search(request):
             # Create a set of titles
             user_courses = {course.course.title for course in enrollments}
 
+    # Get dynamic subject choices from courses that are published
+    available_subjects = (
+        Subject.objects.filter(courses__status="published")
+        .distinct()
+        .order_by("order", "name")
+        .values_list("slug", "name")
+    )
+
     context = {
         "page_obj": page_obj,
         "query": query,
@@ -1577,7 +1587,7 @@ def course_search(request):
         "min_price": min_price,
         "max_price": max_price,
         "sort_by": sort_by,
-        "subject_choices": Course._meta.get_field("subject").choices,
+        "subject_choices": list(available_subjects),
         "level_choices": Course._meta.get_field("level").choices,
         "total_results": total_results,
         "is_teacher": is_teacher,
@@ -3487,7 +3497,11 @@ def system_status(request):
             status["sendgrid"]["message"] = f"API Error: {str(e)}"
     else:
         status["sendgrid"]["status"] = "error"
-        status["sendgrid"]["message"] = "SendGrid API key not configured"
+
+        if settings.DEBUG:
+            status["sendgrid"]["message"] = "SendGrid API key not configured"
+        else:
+            status["sendgrid"]["message"] = "Email service unavailable"
 
     # Check disk space
     try:
@@ -4875,7 +4889,7 @@ def virtual_classroom_list(request):
     return render(
         request,
         "virtual_classroom/list.html",
-        {"classrooms": classrooms, "user": request.user},  # Pass the user object which includes the profile
+        {"classrooms": classrooms},
     )
 
 
@@ -4883,7 +4897,6 @@ def virtual_classroom_list(request):
 @require_POST
 def join_global_virtual_classroom(request):
     """Join (or create) the global virtual classroom and redirect to it."""
-
     teacher = User.objects.filter(is_staff=True, is_active=True).order_by("-is_superuser", "date_joined").first()
 
     if not teacher:
@@ -4978,21 +4991,12 @@ def virtual_classroom_detail(request, classroom_id):
 
     # Check if user is teacher or enrolled student
     is_teacher = request.user == classroom.teacher
-    is_enrolled = False
-
-    if classroom.course:
-        # For classrooms with a course, check course enrollments
-        is_enrolled = classroom.course.enrollments.filter(student=request.user, status="approved").exists()
-    else:
-        # For standalone classrooms, check VirtualClassroomParticipant table
-        is_enrolled = VirtualClassroomParticipant.objects.filter(classroom=classroom, user=request.user).exists()
-
-    if not (is_teacher or is_enrolled):
+    is_enrolled = can_access_classroom(request.user, classroom)
+    if not is_enrolled:
         messages.error(request, "You do not have access to this virtual classroom.")
         if classroom.course:
             return redirect("course_detail", slug=classroom.course.slug)
-        else:
-            return redirect("virtual_classroom_list")
+        return redirect("virtual_classroom_list")
 
     # Get or create customization settings to prevent DoesNotExist errors
     customization, created = VirtualClassroomCustomization.objects.get_or_create(
@@ -5617,11 +5621,15 @@ def create_donation_subscription(request: HttpRequest) -> JsonResponse:
         # Create or get customer
         customer = None
         # Try to retrieve existing customer for authenticated users
-        if request.user.is_authenticated and hasattr(request.user, "stripe_customer_id"):
-            from contextlib import suppress
+        if request.user.is_authenticated:
+            try:
+                membership = request.user.membership
+                if membership.stripe_customer_id:
+                    customer = stripe.Customer.retrieve(membership.stripe_customer_id)
+            except (UserMembership.DoesNotExist, stripe.error.InvalidRequestError):
+                # No membership or invalid customer ID
+                customer = None
 
-            with suppress(stripe.error.InvalidRequestError):
-                customer = stripe.Customer.retrieve(request.user.stripe_customer_id)
         # Create new customer if needed
         if not customer:
             customer = stripe.Customer.create(
@@ -5631,8 +5639,13 @@ def create_donation_subscription(request: HttpRequest) -> JsonResponse:
                 },
             )
             if request.user.is_authenticated:
-                request.user.stripe_customer_id = customer.id
-                request.user.save()
+                # Store customer ID in user membership
+                membership, _ = UserMembership.objects.get_or_create(
+                    user=request.user, defaults={"plan_id": 1, "stripe_customer_id": customer.id}
+                )
+                if not membership.stripe_customer_id:
+                    membership.stripe_customer_id = customer.id
+                    membership.save()
 
         # Create a PaymentIntent for the first payment with setup_future_usage
         payment_intent = stripe.PaymentIntent.create(
